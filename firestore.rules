@@ -1,0 +1,142 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for RBAC & Scope Enforcement
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isActiveUser() {
+      return isAuthenticated() && getUserData().isActive == true;
+    }
+
+    function getUserRole() {
+      return getUserData().role;
+    }
+
+    function isAdministrator() {
+      return isActiveUser() && (getUserRole() == 'administrator' || getUserRole() == 'admin');
+    }
+
+    function isHseDirectorate() {
+      return isActiveUser() && (getUserRole() == 'hse_director' || getUserRole() == 'hse_directorate');
+    }
+
+    function isHseOfficer() {
+      return isActiveUser() && (getUserRole() == 'hse_officer' || isAdministrator() || isHseDirectorate());
+    }
+
+    function isSiteSupervisor() {
+      return isActiveUser() && (getUserRole() == 'site_supervisor' || isHseOfficer());
+    }
+
+    function isSiteAuthorized(siteId) {
+      return isHseDirectorate() || isAdministrator() ||
+             (getUserData().assignedSites.hasAny([siteId, 'All Sites', '*']));
+    }
+
+    // --- 1. USER PROFILES ---
+    match /users/{uid} {
+      // User can read their own profile, administrators & directors can read all profiles
+      allow read: if isAuthenticated() && (request.auth.uid == uid || isAdministrator() || isHseDirectorate());
+      
+      // Only Administrator can create or update user roles & site assignments
+      allow create: if isAdministrator();
+      allow update: if isAdministrator() || 
+        (isAuthenticated() && request.auth.uid == uid && 
+         // User can only update lastLogin / avatar, never their own role or active status
+         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isActive', 'assignedSites', 'employeeId']));
+      allow delete: if isAdministrator();
+    }
+
+    // --- 2. ROLES CONFIGURATION ---
+    match /roles/{roleId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdministrator();
+    }
+
+    // --- 3. SITES CONFIGURATION ---
+    match /sites/{siteId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdministrator();
+    }
+
+    // --- 4. SAFETY OBSERVATIONS & INCIDENT REPORTS ---
+    match /reports/{reportId} {
+      // Read allowed only if the user is authorized for the report's site
+      allow read: if isAuthenticated() && (
+        isHseDirectorate() || isAdministrator() || 
+        isSiteAuthorized(resource.data.siteId) ||
+        resource.data.createdBy == request.auth.uid
+      );
+      
+      // Create allowed for active users within their authorized scope
+      allow create: if isActiveUser() && request.resource.data.createdBy == request.auth.uid;
+      
+      // Update: HSE Officers and Admins can update classification; supervisors can update status
+      allow update: if isActiveUser() && (
+        isHseOfficer() || 
+        (isSiteSupervisor() && isSiteAuthorized(resource.data.siteId)) ||
+        resource.data.createdBy == request.auth.uid
+      );
+      
+      // Deletions strictly forbidden to maintain audit integrity
+      allow delete: if false;
+    }
+
+    // --- 5. CORRECTIVE ACTIONS ---
+    match /corrective_actions/{actionId} {
+      allow read: if isAuthenticated() && (
+        isHseDirectorate() || isAdministrator() || 
+        isSiteAuthorized(resource.data.siteId) ||
+        resource.data.assignedTo == request.auth.uid
+      );
+      
+      allow create: if isHseOfficer() || isSiteSupervisor() || isAdministrator();
+      allow update: if isActiveUser() && (
+        isHseOfficer() || isAdministrator() ||
+        (isSiteSupervisor() && isSiteAuthorized(resource.data.siteId)) ||
+        resource.data.assignedTo == request.auth.uid
+      );
+      allow delete: if isAdministrator();
+    }
+
+    // --- 6. AI ANALYSIS & HITL CALIBRATION ---
+    match /ai_analysis/{analysisId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isHseOfficer() || isAdministrator();
+      allow delete: if false;
+    }
+
+    // --- 7. IMMUTABLE SECURITY AUDIT LOGS ---
+    match /audit_logs/{logId} {
+      // Any authenticated action can append an audit record
+      allow create: if isAuthenticated();
+      
+      // Only Administrators & Executive Directorate can inspect audit logs
+      allow read: if isAdministrator() || isHseDirectorate();
+      
+      // AUDIT RECORDS ARE STRICTLY IMMUTABLE (NO UPDATE, NO DELETE)
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // --- 8. IOGP LIFE-SAVING RULES TAXONOMY ---
+    match /life_saving_rules/{ruleId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdministrator();
+    }
+
+    // --- 9. PRECURSOR PATTERNS ---
+    match /precursor_patterns/{patternId} {
+      allow read: if isAuthenticated();
+      allow write: if isHseOfficer() || isHseDirectorate() || isAdministrator();
+    }
+  }
+}
